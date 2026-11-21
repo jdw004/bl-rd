@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+output.jsonl
+build-report.json
+generation-report.json
+patch-analysis-report.json
+comparison-report.json
+container-report.json
+container-*-report.json
+local-repeat-report.json
+.venv/

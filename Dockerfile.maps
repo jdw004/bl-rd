@@ -1,0 +1,18 @@
+# Explicit regeneration only. Never reads sample patches, answers, or old maps.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS mapping
+COPY requirements.lock /build/requirements.lock
+RUN python -m pip install --disable-pip-version-check --no-cache-dir \
+    --index-url https://pypi.org/simple -r /build/requirements.lock
+COPY fetch_source.py build_dependencies.py dependency_structure.py artifact_bundle.py /build/
+RUN python /build/fetch_source.py /opt/sqlglot
+ENV SKIP_INTEGRATION=0 PYTHONPATH=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONHASHSEED=0 OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+    BLAST_RADIUS_BASE_IMAGE=python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+# Partial evidence is exported, with failures/gaps retained for runtime fallback.
+RUN --network=none python /build/build_dependencies.py --source /opt/sqlglot \
+    --provenance /opt/sqlglot.source.json --requirements /build/requirements.lock \
+    --output /opt/maps --timeout 420 --allow-incomplete
+
+FROM scratch AS export
+COPY --from=mapping /opt/maps /maps
+COPY --from=mapping /opt/generation-report.json /generation-report.json

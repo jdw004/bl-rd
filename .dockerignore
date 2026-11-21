@@ -1,0 +1,16 @@
+# Submission builds include generated maps but no sample patches or answers.
+**
+!Dockerfile
+!requirements.lock
+!selector.py
+!dependency_map.py
+!fetch_source.py
+!build_dependencies.py
+!dependency_structure.py
+!artifact_bundle.py
+!validate_maps.py
+!unified_diff.py
+!patch_analysis.py
+!selection.py
+!maps
+!maps/**

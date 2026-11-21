@@ -1,0 +1,7 @@
+**
+!Dockerfile.maps
+!requirements.lock
+!fetch_source.py
+!build_dependencies.py
+!dependency_structure.py
+!artifact_bundle.py
