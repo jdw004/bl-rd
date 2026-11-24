@@ -14,10 +14,40 @@ from unittest.mock import patch
 from dependency_map import DependencyMap, PINNED_COMMIT
 from artifact_bundle import read_bundle, write_bundle
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class SourceIndexTests(unittest.TestCase):
+    def test_import_without_calling_python_frame(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'native_import_target.py').write_text('value = 7\n')
+            program = '''
+import importlib, sys
+from pathlib import Path
+from build_dependencies import Recorder
+root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+recorder = Recorder(root)
+recorder.start()
+original = sys._getframe
+def missing_frame(*args):
+    raise ValueError('call stack is not deep enough')
+try:
+    sys._getframe = missing_frame
+    module = __import__('native_import_target')
+    assert module.value == 7
+    assert importlib.import_module('native_import_target') is module
+finally:
+    sys._getframe = original
+    recorder.stop()
+assert ('<external>', 'native_import_target') in recorder.imports[('collection', '')]
+assert recorder.module_files['native_import_target'] == 'native_import_target.py'
+'''
+            result = subprocess.run([sys.executable, '-B', '-c', program, str(root)],
+                                    cwd=ROOT, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_unmapped_bytecode_lines_in_module_and_nested_functions(self):
         import dis
         from build_dependencies import source_index, source_manifest
@@ -302,8 +332,9 @@ def factory(base):
     def test_metadata_and_permissions(self):
         metadata = self.data["metadata"]
         self.assertTrue(metadata["run_complete"])
-        self.assertFalse(metadata["instrumentation_complete"])  # external unittest inheritance is explicit
-        self.assertTrue(any(row["kind"] == "inheritance" for row in metadata["unresolved_dependencies"]))
+        self.assertTrue(metadata["instrumentation_complete"])
+        self.assertFalse(any(row["reason"] == "base is external or unresolved statically"
+                             for row in metadata["unresolved_dependencies"]))
         self.assertTrue(metadata["environment_mismatch"])
         self.assertTrue(metadata["source_unchanged"])
         self.assertEqual(metadata["skip_integration"], "0")
@@ -358,8 +389,8 @@ def test_skipped():
     def test_skips_child_processes_and_deadline_are_explicit(self):
         cases = [
             ("skip", 'import pytest\n@pytest.mark.skip(reason="example")\ndef test_extra(): pass\n', 0),
-            ("child", 'import subprocess, sys\ndef test_extra():\n    subprocess.run([sys.executable, "-c", "pass"], check=True)\n', 1),
-            ("thread", 'import threading\ndef test_extra():\n    worker = threading.Thread(target=lambda: None)\n    worker.start()\n    worker.join()\n', 1),
+            ("child", 'import subprocess, sys\ndef test_extra():\n    subprocess.run([sys.executable, "-c", "pass"], check=True)\n', 0),
+            ("thread", 'import threading\ndef test_extra():\n    worker = threading.Thread(target=lambda: None)\n    worker.start()\n    worker.join()\n', 0),
             ("deadline", 'import time\ndef test_extra(): time.sleep(20)\n', 1),
         ]
         for name, source, expected in cases:
@@ -375,15 +406,15 @@ def test_skipped():
                     result = subprocess.run(command, capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                     partial = read_bundle(output, require_pinned=False)[0]["metadata"]
-                    self.assertFalse(partial["instrumentation_complete"])
                     if name == "skip":
+                        self.assertFalse(partial["instrumentation_complete"])
                         self.assertTrue(partial["run_complete"])
                         self.assertIn("tests/test_extra.py::test_extra", partial["incomplete_tests"])
-                    elif name == "child":
-                        self.assertTrue(any("child process" in issue for issue in partial["instrumentation_issues"]))
-                    elif name == "thread":
-                        self.assertTrue(any("thread started" in issue for issue in partial["instrumentation_issues"]))
+                    elif name in {"child", "thread"}:
+                        self.assertTrue(partial["instrumentation_complete"])
+                        self.assertEqual(partial["instrumentation_issues"], [])
                     else:
+                        self.assertFalse(partial["instrumentation_complete"])
                         self.assertFalse(partial["run_complete"])
                         self.assertTrue(any("deadline" in issue for issue in partial["instrumentation_issues"]))
                 finally:

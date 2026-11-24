@@ -61,39 +61,61 @@ def main() -> None:
                         default=Path(__file__).resolve().parent / "maps")
     parser.add_argument("--all-tests", action="store_true", help="run the full-suite comparison baseline")
     parser.add_argument("--strategy", choices=("all", "file", "function", "hybrid"), default="hybrid")
+    parser.add_argument("--probe", action="store_true", help="experiment: run affordable candidates before scheduling")
+    parser.add_argument("--probe-wall-seconds", type=float, default=15.0)
     options = parser.parse_args()
     strategy = "all" if options.all_tests else options.strategy
     tests = json.loads((options.data_dir / "tests.json").read_text())["tests"]
     analyzer = None
     selector = None
+    dependencies = None
+    fallback_reasons = ["baseline_requested" if strategy == "all" else "maps_unavailable"]
     if strategy == "all":
         print("full-suite baseline requested", file=sys.stderr)
     elif options.dependency_map.exists():
         try:
             dependencies = DependencyMap(options.dependency_map, tests)
             print(dependencies.summary(), file=sys.stderr)
-            analyzer = PatchAnalyzer.from_data(dependencies.data)
-            selector = TestSelector(dependencies, tests, strategy=strategy)
+            if dependencies.global_fallback_reasons:
+                fallback_reasons = dependencies.global_fallback_reasons
+            else:
+                analyzer = PatchAnalyzer.from_data(dependencies.data)
+                selector = TestSelector(dependencies, tests, strategy=strategy)
         except (OSError, ValueError, KeyError, IndexError, TypeError, EOFError) as error:
             print(f"dependency map unavailable: {error}; selecting all tests", file=sys.stderr)
     else:
         print("dependency map absent; selecting all tests", file=sys.stderr)
     all_numbers = {test["number"] for test in tests}
+    probe = None
+    if options.probe:
+        from runtime_probe import ProbeBudget
+        probe = ProbeBudget(wall_seconds=min(120.0, options.probe_wall_seconds))
     schedules = {}
     selected_total = commit_count = 0
     for patch in sorted((options.data_dir / "commits").glob("*.patch")):
         selected = all_numbers
-        decision = {"mode": "all", "reasons": ["baseline_requested" if strategy == "all" else "maps_unavailable"]}
+        decision = {"mode": "all", "reasons": fallback_reasons}
         if analyzer is not None and selector is not None:
-            change = analyzer.analyze(patch.read_bytes())
+            raw_patch = patch.read_bytes()
+            change = analyzer.analyze(raw_patch)
             selected, decision = selector.select(change)
+            if probe is not None and decision["mode"] != "all":
+                eligible = selected - dependencies.uncertain_numbers
+                chosen = [test for test in tests if test["number"] in eligible]
+                durations = {test["number"]: duration_milliseconds(test["seconds"]) for test in chosen}
+                schedule = allocate(chosen)
+                cost = (max((sum(durations[n] for n in worker) for worker in schedule), default=0)
+                        + WORKER_COST_MILLISECONDS * len(schedule)) / 1000
+                retained, evidence = probe.refine(analyzer.baseline, raw_patch, eligible, tests, cost)
+                selected = (selected - eligible) | retained
+                decision["probe"] = evidence
         key = tuple(sorted(selected))
         if key not in schedules:
             schedules[key] = allocate([test for test in tests if test["number"] in selected])
         workers = schedules[key]
         print(json.dumps({"commit": patch.stem, "strategy": strategy,
                           "fallback": strategy != "all" and decision["mode"] == "all",
-                          "uncertain_tests": len(dependencies.uncertain_numbers) if selector else 0,
+                          "uncertain_tests": len(dependencies.uncertain_numbers) if dependencies else 0,
                           "selected_tests": len(selected), **decision}), file=sys.stderr)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         selected_total += len(selected)

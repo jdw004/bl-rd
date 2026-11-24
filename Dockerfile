@@ -5,7 +5,7 @@ COPY maps /app/maps
 COPY selector.py dependency_map.py artifact_bundle.py validate_maps.py /app/
 COPY unified_diff.py patch_analysis.py /app/
 COPY selection.py /app/
-COPY requirements.lock build_dependencies.py dependency_structure.py fetch_source.py /app/
+COPY requirements.lock build_dependencies.py dependency_structure.py fetch_source.py process_dependencies.py /app/
 RUN python /app/validate_maps.py --artifacts /app/maps \
     --requirements /app/requirements.lock --tools-root /app
 

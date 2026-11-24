@@ -1,4 +1,4 @@
-"""Bounded subprocess capture for local evaluation tools, never the selector."""
+"""Bounded subprocess capture and process-group cleanup."""
 
 import os
 import resource
@@ -11,12 +11,12 @@ from types import SimpleNamespace
 STDOUT_LIMIT = 2_000_000  # Decimal MB is stricter than 2 MiB.
 
 
-def run_bounded(command, *, cwd=None, timeout=180, output_limit=STDOUT_LIMIT):
+def run_bounded(command, *, cwd=None, timeout=180, output_limit=STDOUT_LIMIT, env=None):
     started = time.monotonic()
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               start_new_session=True)
+                               start_new_session=True, env=env)
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     failure = None
     with selectors.DefaultSelector() as poll:

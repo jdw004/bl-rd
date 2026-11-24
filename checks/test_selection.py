@@ -10,7 +10,7 @@ from patch_analysis import PatchAnalyzer
 from score import evaluate_run
 from selection import TestSelector
 from selector import allocate
-from test_patch_analysis import diff
+from checks.test_patch_analysis import diff
 
 
 class SelectionTests(unittest.TestCase):
@@ -159,6 +159,48 @@ class SelectionTests(unittest.TestCase):
         self.data["functions"] = {}
         changed = self.source.decode().replace("def left():", "@decorate\ndef left():")
         self.assertEqual(self.engine().select(self.change(changed))[1]["mode"], "all")
+
+    def precise_branch_map(self):
+        self.source = b"def left(flag):\n    if flag:\n        return 1\n    return 2\n"
+        self.data["test_sets"].extend([[0, 1], []])
+        self.data["functions"] = {"mod.py": [["left", 1, 4, 3]]}
+        self.data["lines"] = {"mod.py": [[2, 2, 3], [3, 3, 0], [4, 4, 1]]}
+        self.data["metadata"].update(read_provenance="loader-separated-v1", reflection_index="executed-identifiers-v1")
+        self.data["reflection_tests"] = 4
+
+    def test_statement_selection_excludes_other_branch(self):
+        self.precise_branch_map()
+        selected, decision = self.engine().select(self.change())
+        self.assertEqual(selected, {0})
+        self.assertIn("executed_statement_consumers", decision["reasons"][0])
+        self.assertEqual(self.engine(strategy="function").select(self.change())[0], {0, 1})
+
+    def test_new_local_or_inserted_statement_retains_function_scope(self):
+        self.precise_branch_map()
+        for replacement in ("        value = 3", "        value = 3\n        return value"):
+            change = self.change(self.source.decode().replace("        return 1", replacement))
+            self.assertIsNone(change["files"][0]["python"]["body_statement_ranges"])
+            self.assertEqual(self.engine().select(change)[0], {0, 1})
+
+    def test_source_only_change_keeps_reflective_consumers(self):
+        self.precise_branch_map()
+        self.data["reflection_tests"] = 2
+        change = self.change("# comment\n" + self.source.decode())
+        self.assertEqual(self.engine().select(change)[0], {2})
+        self.data["reads"]["mod.py"] = 1
+        self.assertEqual(self.engine().select(change)[0], {1, 2})
+        del self.data["metadata"]["reflection_index"]
+        self.assertEqual(self.engine().select(change)[0], {0, 1, 2})
+
+    def test_owned_child_gap_is_included_for_every_change(self):
+        self.precise_branch_map()
+        self.data["metadata"]["gap_tests"] = [self.tests[1]["id"]]
+        self.assertEqual(self.engine().select(self.change())[0], {0, 1})
+
+    def test_unrelated_static_ambiguity_does_not_replace_body_execution_evidence(self):
+        self.precise_branch_map()
+        self.data["metadata"]["unresolved_dependencies"] = [{"file": "mod.py", "line": 100, "kind": "inheritance"}]
+        self.assertEqual(self.engine().select(self.change())[0], {0})
 
 
 if __name__ == "__main__":

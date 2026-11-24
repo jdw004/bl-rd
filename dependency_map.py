@@ -22,6 +22,7 @@ class DependencyMap:
         metadata = self.data["metadata"]
         self.incomplete_ids = sorted(set(by_id) & (set(metadata["incomplete_tests"]) | set(metadata["missing_mappings"])))
         self.uncertain_numbers = self.unmapped_numbers | {by_id[node] for node in self.incomplete_ids}
+        self.uncertain_numbers.update(by_id[node] for node in metadata.get("gap_tests", []) if node in by_id)
         self.global_fallback_reasons = []
         if not metadata["run_complete"]:
             self.global_fallback_reasons.append("baseline_incomplete")

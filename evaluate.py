@@ -29,7 +29,7 @@ def load_inputs(data_dir, answers_path):
 
 
 def evaluate(data_dir: Path, answers_path: Path, selector: Path, all_tests: bool = False,
-             strategy: str = "hybrid") -> tuple[dict, bytes]:
+             strategy: str = "hybrid", probe: bool = False) -> tuple[dict, bytes]:
     tests, answers, patches = load_inputs(data_dir, answers_path)
     strategy = "all" if all_tests else strategy
 
@@ -42,11 +42,12 @@ def evaluate(data_dir: Path, answers_path: Path, selector: Path, all_tests: bool
         for patch in patches:
             shutil.copyfile(patch, staged / "commits" / patch.name)
         process = run_bounded(
-            [sys.executable, "-B", str(selector.resolve()), "--data-dir", str(staged), "--strategy", strategy],
+            [sys.executable, "-B", str(selector.resolve()), "--data-dir", str(staged), "--strategy", strategy]
+            + (["--probe"] if probe else []),
             cwd=staged,
         )
     report = summarize(process.stdout, process.stderr, tests, answers)
-    report.update(strategy=strategy, selector_exit_code=process.returncode,
+    report.update(strategy=strategy, probe=probe, selector_exit_code=process.returncode,
                   selector_cpu_seconds=process.cpu_seconds, wall_seconds=process.wall_seconds,
                   execution_failure=process.failure)
     if process.stderr:
@@ -138,6 +139,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="print a machine-readable report")
     parser.add_argument("--all-tests", action="store_true", help="evaluate the full-suite comparison baseline")
     parser.add_argument("--strategy", choices=("all", "file", "function", "hybrid"), default="hybrid")
+    parser.add_argument("--probe", action="store_true", help="evaluate optional runtime probing")
     options = parser.parse_args()
     try:
         report, stdout = evaluate(
@@ -146,6 +148,7 @@ def main() -> int:
             ROOT / "selector.py",
             all_tests=options.all_tests,
             strategy=options.strategy,
+            probe=options.probe,
         )
         if options.output:
             options.output.write_bytes(stdout)

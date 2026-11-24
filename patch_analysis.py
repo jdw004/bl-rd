@@ -9,6 +9,7 @@ import io
 import json
 import sys
 import tokenize
+import types
 from types import MappingProxyType
 
 from artifact_bundle import PINNED_COMMIT, read_bundle
@@ -65,6 +66,7 @@ def scope_components(node):
     local = list(own_nodes(body))
     components = {
         "body": projection(body),
+        "docstring": ast.get_docstring(node, clean=False),
         "imports": [structural(child) for child in local if isinstance(child, (ast.Import, ast.ImportFrom))],
         "assignments": [structural(child) for child in local if isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign))],
     }
@@ -132,6 +134,65 @@ def index_tree(tree):
     return symbols, sorted(set(duplicates))
 
 
+def definition_occurrences(tree):
+    result = {}
+
+    def visit(node, parents=()):
+        if isinstance(node, DEFINITIONS):
+            parents += (node.name,)
+            result.setdefault(".".join(parents), []).append(fingerprint(structural(node)))
+        for child in ast.iter_child_nodes(node):
+            visit(child, parents)
+
+    visit(tree)
+    return result
+
+
+def executed_statement_ranges(original, modified, old_tree, changes, edits, path):
+    """A body replacement can only affect tests that reached its old statement.
+
+    Reject insertions/deletions and compiler scope changes: a new local, closure
+    binding, or yield can change behavior before the edited statement executes.
+    """
+    leaves = [change for change in changes if change["categories"] != ["nested_definitions"]]
+    if not leaves or any(change["change"] != "modified" or change["definition_time_change"]
+                         or change["kind"] not in {"FunctionDef", "AsyncFunctionDef"} for change in leaves):
+        return None
+    if any(not edit["old"][1] - edit["old"][0]
+           or edit["old"][1] - edit["old"][0] != edit["new"][1] - edit["new"][0] for edit in edits):
+        return None
+
+    def scope_signatures(source):
+        signatures = {}
+
+        def visit(code):
+            name = code.co_qualname.replace(".<locals>.", ".")
+            signatures.setdefault(name, []).append((code.co_varnames, code.co_cellvars, code.co_freevars, code.co_flags))
+            for value in code.co_consts:
+                if isinstance(value, types.CodeType):
+                    visit(value)
+
+        visit(compile(source, path, "exec"))
+        return signatures
+
+    old_signatures, new_signatures = scope_signatures(original), scope_signatures(modified)
+    for change in leaves:
+        name = change["identity"].split("::", 1)[1]
+        if old_signatures.get(name) != new_signatures.get(name):
+            return None
+    statements = [node for node in ast.walk(old_tree)
+                  if isinstance(node, ast.stmt) and not isinstance(node, DEFINITIONS)]
+    ranges = []
+    for edit in edits:
+        first, last = edit["old"][0] + 1, edit["old"][1]
+        candidates = [node for node in statements if node.lineno <= first and node.end_lineno >= last]
+        if not candidates:
+            return None
+        node = min(candidates, key=lambda item: (item.end_lineno - item.lineno, -item.col_offset))
+        ranges.append([node.lineno, node.end_lineno])
+    return ranges
+
+
 def parse_source(source, path):
     encoding, _ = tokenize.detect_encoding(io.BytesIO(source).readline)
     tree = ast.parse(source, filename=path, type_comments=True)
@@ -177,7 +238,7 @@ def compare_python(original, modified, old_path, new_path, edits):
         else:
             categories = ["definition_added" if new else "definition_removed"]
         header_change = bool(set(categories) & {"definition_added", "definition_removed", "kind", "decorators",
-            "signature", "defaults", "annotations", "type_parameters", "bases", "class_keywords"})
+            "signature", "defaults", "annotations", "type_parameters", "bases", "class_keywords", "docstring"})
         class_initialization = reference["kind"] == "ClassDef" and bool(set(categories) & {"body", "class_attributes", "imports"})
         parent = reference["parent"]
         while parent not in old_symbols and parent != "<module>":
@@ -206,9 +267,13 @@ def compare_python(original, modified, old_path, new_path, edits):
             "message": "Source bytes or line positions changed; reflection, encoding, comments and fixture metadata may matter."})
     if old_encoding != new_encoding:
         uncertainty.append({"code": "encoding_changed", "message": f"{old_encoding} -> {new_encoding}"})
-    if old_duplicates or new_duplicates:
+    duplicate_names = set(old_duplicates + new_duplicates)
+    before_occurrences, after_occurrences = definition_occurrences(old_tree), definition_occurrences(new_tree)
+    affected_duplicates = sorted(name for name in duplicate_names
+                                 if before_occurrences.get(name) != after_occurrences.get(name))
+    if affected_duplicates:
         uncertainty.append({"code": "ambiguous_symbol_identity", "message": "Repeated qualified definitions require fallback.",
-                            "symbols": sorted(set(old_duplicates + new_duplicates))})
+                            "symbols": affected_duplicates})
     additions = []
     old_count = len(lines(original))
     for edit in edits:
@@ -234,7 +299,8 @@ def compare_python(original, modified, old_path, new_path, edits):
             "module_binding_changes": changed_bindings(bindings(old_tree), bindings(new_tree)),
             "module_changes": module_changes, "requires_import_expansion": bool(module_changes)
                 or any(change["requires_import_expansion"] for change in changes),
-            "new_code": additions, "uncertainty_reasons": uncertainty}
+            "new_code": additions, "uncertainty_reasons": uncertainty,
+            "body_statement_ranges": executed_statement_ranges(original, modified, old_tree, changes, edits, path)}
 
 
 class PatchAnalyzer:

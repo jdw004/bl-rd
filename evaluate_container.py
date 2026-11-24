@@ -14,7 +14,7 @@ from process_runner import run_bounded
 # It is not official whole-container accounting and is not the image CMD.
 MEASURE = """
 import json, resource, subprocess, sys
-result = subprocess.run([sys.executable, '-B', '/app/selector.py', '--strategy', sys.argv[1]])
+result = subprocess.run([sys.executable, '-B', '/app/selector.py', '--strategy', *sys.argv[1:]])
 usage = resource.getrusage(resource.RUSAGE_CHILDREN)
 print(json.dumps({'measurement': 'selector_child_cpu', 'seconds': usage.ru_utime + usage.ru_stime}), file=sys.stderr)
 sys.exit(result.returncode)
@@ -30,6 +30,8 @@ assert os.environ['PYTHONDONTWRITEBYTECODE'] == '1'
 assert platform.machine() == 'x86_64' and platform.system() == 'Linux'
 expected = {'selector.py', 'selection.py', 'dependency_map.py', 'artifact_bundle.py',
             'unified_diff.py', 'patch_analysis.py', 'maps'}
+if os.environ.get('SELECTOR_PROBE_IMAGE') == '1':
+    expected.update({'runtime_probe.py', 'probe_runner.py', 'process_runner.py'})
 assert {p.name for p in Path('/app').iterdir()} == expected
 assert {p.name for p in Path('/app/maps').iterdir()} == {'manifest.json', 'dependencies.json.gz'}
 assert {p.name for p in Path('/data').iterdir()} == {'commits', 'tests.json'}
@@ -78,12 +80,15 @@ def main():
     parser.add_argument("--answers", type=Path)
     parser.add_argument("--image", default="blast-radius-entry")
     parser.add_argument("--strategy", choices=("all", "file", "function", "hybrid"), default="hybrid")
+    parser.add_argument("--probe", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("container-report.json"))
     options = parser.parse_args()
-    report = {"runs": [], "success": False, "deterministic": None, "strategy": options.strategy,
+    report = {"runs": [], "success": False, "deterministic": None, "strategy": options.strategy, "probe": options.probe,
               "limits": {"seconds": 180, "stdout_bytes": 2_000_000, "cpus": 2,
                          "memory_bytes": 4 * 1024**3, "tmp_bytes": 64 * 1024**2, "pids": 256},
               "cpu_scope": "selector child user+system; excludes wrapper/startup; not official container CPU"}
+    if options.probe:
+        report["cpu_scope"] += "; killed grandchildren may not be included"
     try:
         tests, answers, _ = load_inputs(options.data_dir, options.answers or options.data_dir / "answers.json")
         inspected = subprocess.run(["docker", "image", "inspect", options.image], capture_output=True,
@@ -99,7 +104,7 @@ def main():
         report["artifact_audit"] = json.loads(audit.stdout)
         for _ in range(3):
             result = container_run(image["Id"], options.data_dir,
-                                   ["python", "-B", "-c", MEASURE, options.strategy])
+                                   ["python", "-B", "-c", MEASURE, options.strategy] + (["--probe"] if options.probe else []))
             row = summarize(result.stdout, result.stderr, tests, answers)
             row.update(wall_seconds=result.wall_seconds, selector_exit_code=result.returncode,
                        execution_failure=result.failure, selector_cpu_seconds=None,

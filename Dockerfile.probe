@@ -1,0 +1,24 @@
+# Optional runtime-probing experiment. Normal submission builds are unchanged.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS dependencies
+COPY requirements.lock /tmp/requirements.lock
+RUN python -m pip install --disable-pip-version-check --no-cache-dir \
+    --index-url https://pypi.org/simple -r /tmp/requirements.lock \
+    && rm /tmp/requirements.lock
+
+FROM dependencies AS validation
+COPY maps /app/maps
+COPY selector.py dependency_map.py artifact_bundle.py validate_maps.py /app/
+COPY unified_diff.py patch_analysis.py selection.py /app/
+COPY requirements.lock build_dependencies.py dependency_structure.py fetch_source.py process_dependencies.py /app/
+RUN python /app/validate_maps.py --artifacts /app/maps \
+    --requirements /app/requirements.lock --tools-root /app
+
+FROM dependencies AS runtime
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 HOME=/tmp SKIP_INTEGRATION=0 SELECTOR_PROBE_IMAGE=1
+COPY --from=validation --chmod=644 /app/maps/manifest.json /app/maps/dependencies.json.gz /app/maps/
+COPY --from=validation --chmod=644 /app/selector.py /app/selection.py /app/dependency_map.py /app/artifact_bundle.py /app/unified_diff.py /app/patch_analysis.py /app/
+COPY --chmod=644 runtime_probe.py probe_runner.py process_runner.py /app/
+RUN chmod 755 /app /app/maps
+USER 65534:65534
+CMD ["python", "/app/selector.py", "--probe"]

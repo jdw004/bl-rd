@@ -3,5 +3,6 @@
 !requirements.lock
 !fetch_source.py
 !build_dependencies.py
+!process_dependencies.py
 !dependency_structure.py
 !artifact_bundle.py

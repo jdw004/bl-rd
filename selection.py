@@ -16,6 +16,7 @@ class TestSelector:
         self.strategy = strategy
         self.dependencies = dependencies
         self.data = dependencies.data
+        self.precise_reads = self.data["metadata"].get("read_provenance") == "loader-separated-v1"
         self.all_numbers = {test["number"] for test in tests}
         self.functions = defaultdict(dict)
         for path, definitions in self.data["functions"].items():
@@ -78,11 +79,16 @@ class TestSelector:
         selected = set(self.dependencies.uncertain_numbers)
         for file in change["files"]:
             path = file["old_path"] or file["new_path"]
-            if file["uncertainty_reasons"]:
+            python = file.get("python", {})
+            source_only = (self.precise_reads and python.get("identical_ast")
+                           and self.data["metadata"].get("reflection_index") == "executed-identifiers-v1"
+                           and all(reason["code"] == "identical_ast_not_safety_proof" for reason in file["uncertainty_reasons"]))
+            if file["uncertainty_reasons"] and not source_only:
                 return all_tests(path + ":" + ";".join(reason["code"] for reason in file["uncertainty_reasons"]))
-            if path in self.dependencies.unresolved_by_path:
+            relationship_change = not self.precise_reads or python.get("requires_import_expansion", False)
+            if relationship_change and path in self.dependencies.unresolved_by_path:
                 return all_tests(path + ":unresolved_relationship")
-            if self.strategy == "hybrid" and any(
+            if relationship_change and self.strategy == "hybrid" and any(
                     affected in self.dependencies.unresolved_by_path
                     for affected in self.dependencies.affected_files(path)):
                 return all_tests(path + ":unresolved_dependent_relationship")
@@ -90,6 +96,12 @@ class TestSelector:
                 # New/deleted/renamed files and permission changes can affect
                 # discovery and dynamic loading beyond baseline observations.
                 return all_tests(path + ":file_structure_changed")
+            if source_only:
+                selected.update(self.dependencies.read_consumers(path))
+                selected.update(self.dependencies.sets[self.data["reflection_tests"]])
+                selected.update(self.by_test_file.get(path, set()))
+                reasons.append(path + ":source_and_position_observers")
+                continue
             if file["dependency_kind"] == "repository_data_file":
                 if self.strategy == "function":
                     return all_tests(path + ":outside_function_coverage")
@@ -110,6 +122,17 @@ class TestSelector:
                     return all_tests(path + ":no_initialization_mapping")
                 selected.update(consumers)
                 reasons.append(path + (":file_dependencies" if self.strategy == "file" else ":initialization_dependencies"))
+                continue
+            ranges = python.get("body_statement_ranges")
+            if self.strategy == "hybrid" and self.precise_reads and ranges:
+                # Complete child/task tracing and separate source reads are
+                # prerequisites; old artifacts cannot use this narrower query.
+                for first, last in ranges:
+                    selected.update(self.dependencies.line_consumers(path, first, last))
+                selected.update(self.dependencies.read_consumers(path))
+                selected.update(self.dependencies.sets[self.data["reflection_tests"]])
+                selected.update(self.by_test_file.get(path, set()))
+                reasons.append(path + ":executed_statement_consumers")
                 continue
             matched = False
             for symbol in python["symbol_changes"]:

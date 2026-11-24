@@ -1,16 +1,21 @@
 # Submission builds include generated maps but no sample patches or answers.
 **
 !Dockerfile
+!Dockerfile.probe
 !requirements.lock
 !selector.py
 !dependency_map.py
 !fetch_source.py
 !build_dependencies.py
+!process_dependencies.py
 !dependency_structure.py
 !artifact_bundle.py
 !validate_maps.py
 !unified_diff.py
 !patch_analysis.py
 !selection.py
+!runtime_probe.py
+!probe_runner.py
+!process_runner.py
 !maps
 !maps/**

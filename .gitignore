@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.DS_Store
+.local/
 output.jsonl
 build-report.json
 generation-report.json

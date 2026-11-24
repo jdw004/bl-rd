@@ -17,6 +17,7 @@ import hashlib
 import importlib
 import importlib.util
 import importlib.metadata
+import importlib.machinery
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,7 @@ import platform
 import signal
 import sys
 import threading
+import tempfile
 import time
 import types
 
@@ -106,6 +108,8 @@ class Recorder:
         self.lines = defaultdict(lambda: defaultdict(set))
         self.functions = defaultdict(lambda: defaultdict(set))
         self.reads = defaultdict(set)
+        self.loader_reads = defaultdict(set)
+        self.source_observers = set()
         self.imports = defaultdict(set)
         self.module_files = {}
         self.classes = {}
@@ -113,6 +117,10 @@ class Recorder:
         self.paths = {}
         self.code_paths = {}
         self.issues = set()
+        self.scoped_issues = []
+        self.expected_children = []
+        self.expected_tasks = []
+        self.threads_seen = False
         self.local = threading.local()
         self.main_thread = threading.get_ident()
         self.monitoring = hasattr(sys, "monitoring")
@@ -134,9 +142,15 @@ class Recorder:
 
     def current(self):
         if threading.get_ident() != self.main_thread:
-            self.issues.add("background thread observed; attributed conservatively to all tests")
             return ("background", "")
         return self.context
+
+    def gap(self, reason, context=None):
+        phase, consumer = context or self.current()
+        if consumer and phase not in {"collection", "background", "child_startup"}:
+            self.scoped_issues.append({"phase": phase, "consumer": consumer, "reason": reason})
+        else:
+            self.issues.add(reason)
 
     @contextmanager
     def scope(self, phase, consumer):
@@ -152,6 +166,8 @@ class Recorder:
                 sys.monitoring.restart_events()
 
     def line(self, code, number):
+        if not self.active:
+            return
         name = self.code_path(code)
         if name:
             context = self.current()
@@ -161,7 +177,7 @@ class Recorder:
                 self.functions[context][name].add((qualified, code.co_firstlineno))
         # Re-enable locations on every phase/fixture change. Each line only
         # needs to be recorded once per context on the serial pytest thread.
-        if self.monitoring and threading.get_ident() == self.main_thread:
+        if self.monitoring and (not name or threading.get_ident() == self.main_thread):
             return sys.monitoring.DISABLE
 
     def code_path(self, code):
@@ -171,6 +187,8 @@ class Recorder:
         return self.code_paths[filename]
 
     def trace(self, frame, event, arg):
+        if not self.active:
+            return None
         if not self.code_path(frame.f_code):
             return None
         if event == "line":
@@ -189,9 +207,11 @@ class Recorder:
                     flags & os.O_ACCMODE != os.O_WRONLY)
                 name = self.relative(path)
                 if readable and name:
-                    self.reads[self.current()].add(name)
+                    target = self.loader_reads if getattr(self.local, "loader_depth", 0) else self.reads
+                    target[self.current()].add(name)
             elif event in {"subprocess.Popen", "os.fork", "os.posix_spawn"}:
-                self.issues.add("child process observed; child execution and native reads are uninstrumented")
+                if not getattr(self.local, "spawn_depth", 0):
+                    self.gap("child process observed without instrumented startup")
         finally:
             self.local.busy = False
 
@@ -214,11 +234,41 @@ class Recorder:
                 self.module_files[name] = filename
 
     def start(self):
+        from process_dependencies import install
+        self.restore_process_hooks = install(self) if os.environ.get("SELECTOR_TRACE_DIRECTORY") else lambda: None
+        self.original_get_data = importlib.machinery.SourceFileLoader.get_data
+        self.original_sourceless_get_data = importlib.machinery.SourcelessFileLoader.get_data
+
+        def loader_read(original):
+            def get_data(loader, path):
+                depth = getattr(self.local, "loader_depth", 0)
+                self.local.loader_depth = depth + 1
+                try:
+                    return original(loader, path)
+                finally:
+                    self.local.loader_depth = depth
+            return get_data
+
+        importlib.machinery.SourceFileLoader.get_data = loader_read(self.original_get_data)
+        importlib.machinery.SourcelessFileLoader.get_data = loader_read(self.original_sourceless_get_data)
         self.original_import = builtins.__import__
+        self.original_getattr = builtins.getattr
         self.original_import_module = importlib.import_module
         self.original_thread_start = threading.Thread.start
         self.original_low_thread_start = _thread.start_new_thread
         self.original_build_class = builtins.__build_class__
+
+        def attribute_lookup(obj, name, /, *default):
+            result = self.original_getattr(obj, name, *default)
+            if self.active and isinstance(name, str) and (
+                    name.startswith(("co_", "tb_")) or name in {"__code__", "f_lineno", "f_code"}):
+                try:
+                    caller = sys._getframe(1).f_code.co_filename
+                except ValueError:
+                    caller = None
+                if self.relative(caller):
+                    self.source_observers.add(self.current())
+            return result
 
         def build_class(function, name, *bases, **kwargs):
             result = self.original_build_class(function, name, *bases, **kwargs)
@@ -239,15 +289,29 @@ class Recorder:
             return result
 
         def thread_start(thread, *args, **kwargs):
-            self.issues.add("background thread started; per-context execution may be incomplete")
+            self.threads_seen = True
+            if self.monitoring:
+                sys.monitoring.restart_events()
             return self.original_thread_start(thread, *args, **kwargs)
 
         def low_thread_start(*args, **kwargs):
-            self.issues.add("low-level thread started; per-context execution may be incomplete")
-            return self.original_low_thread_start(*args, **kwargs)
+            self.threads_seen = True
+            function, arguments = args[:2]
+            keywords = args[2] if len(args) > 2 else kwargs.get("kwargs", {})
+
+            def traced():
+                sys.settrace(self.trace)
+                return function(*arguments, **keywords)
+
+            return self.original_low_thread_start(traced, ())
 
         def importing(name, globals=None, locals=None, fromlist=(), level=0):
-            caller = sys._getframe(1).f_code.co_filename
+            # The interpreter can call __import__ directly from C during
+            # startup. Such an import has no calling Python frame.
+            try:
+                caller = sys._getframe(1).f_code.co_filename
+            except ValueError:
+                caller = None
             result = self.original_import(name, globals, locals, fromlist, level)
             resolved = name
             if level:
@@ -260,7 +324,10 @@ class Recorder:
             return result
 
         def import_module(name, package=None):
-            caller = sys._getframe(1).f_code.co_filename
+            try:
+                caller = sys._getframe(1).f_code.co_filename
+            except ValueError:
+                caller = None
             try:
                 result = self.original_import_module(name, package)
             except ImportError:
@@ -273,21 +340,25 @@ class Recorder:
             return result
 
         builtins.__import__ = importing
+        builtins.getattr = attribute_lookup
         importlib.import_module = import_module
         threading.Thread.start = thread_start
         _thread.start_new_thread = low_thread_start
         builtins.__build_class__ = build_class
         sys.addaudithook(self.audit)
         self.active = True
+        # Legacy tracing is thread-local and independent of the main thread's
+        # sys.monitoring.DISABLE optimization. Keep every background line.
+        self.old_thread_trace = threading.gettrace()
+        threading.settrace(self.trace)
         if self.monitoring:
             sys.monitoring.use_tool_id(self.tool_id, "blast-radius-dependencies")
             sys.monitoring.register_callback(self.tool_id, sys.monitoring.events.LINE, self.line)
             sys.monitoring.set_events(self.tool_id, sys.monitoring.events.LINE)
+            sys.monitoring.restart_events()
         else:
             self.old_trace = sys.gettrace()
-            self.old_thread_trace = threading.gettrace()
             sys.settrace(self.trace)
-            threading.settrace(self.trace)
 
     def stop(self):
         self.active = False
@@ -301,12 +372,16 @@ class Recorder:
             if sys.gettrace() != self.trace:
                 self.issues.add("Python trace function was replaced during instrumentation")
             sys.settrace(self.old_trace)
-            threading.settrace(self.old_thread_trace)
+        threading.settrace(self.old_thread_trace)
         builtins.__import__ = self.original_import
+        builtins.getattr = self.original_getattr
         importlib.import_module = self.original_import_module
         threading.Thread.start = self.original_thread_start
         _thread.start_new_thread = self.original_low_thread_start
         builtins.__build_class__ = self.original_build_class
+        importlib.machinery.SourceFileLoader.get_data = self.original_get_data
+        importlib.machinery.SourcelessFileLoader.get_data = self.original_sourceless_get_data
+        self.restore_process_hooks()
 
 
 class Plugin:
@@ -315,6 +390,7 @@ class Plugin:
         self.nodes = []
         self.outcomes = defaultdict(dict)
         self.collection_errors = []
+        self.failure_diagnostics = []
         self.subtest_failures = set()
         self.fixtures = {}
         self.fixture_users = defaultdict(set)
@@ -391,6 +467,8 @@ class Plugin:
     def pytest_collectreport(self, report):
         if report.failed:
             self.collection_errors.append(report.nodeid)
+            self.failure_diagnostics.append({"nodeid": report.nodeid, "phase": "collection",
+                                             "traceback": report.longreprtext[:16000]})
 
     def pytest_runtest_logreport(self, report):
         # Subtests retain the parent's node ID. A later PASSED parent must
@@ -400,6 +478,10 @@ class Plugin:
             self.outcomes[report.nodeid][report.when] = report.outcome
         if report.failed and hasattr(report, "context"):
             self.subtest_failures.add(report.nodeid)
+        if report.failed and len(self.failure_diagnostics) < 10:
+            self.failure_diagnostics.append({"nodeid": report.nodeid, "phase": report.when,
+                "traceback": report.longreprtext[:16000],
+                "captured": [[name, text[:16000]] for name, text in report.sections]})
 
     @pytest.hookimpl(hookwrapper=True, tryfirst=True)
     def pytest_runtest_setup(self, item):
@@ -445,17 +527,21 @@ def artifact(root, recorder, plugin, manifest, index, metadata):
     line_tests = defaultdict(lambda: defaultdict(set))
     function_tests = defaultdict(lambda: defaultdict(set))
     file_tests = defaultdict(set)
+    loader_tests = defaultdict(set)
     import_tests = defaultdict(lambda: defaultdict(set))
     phase_stats = {}
-    contexts = set(recorder.lines) | set(recorder.reads) | set(recorder.imports)
-    for context in sorted(contexts):
+    def consumers_for(context):
         phase, prefix = context
         if phase.startswith("fixture_"):
-            consumers = {i for i, node in enumerate(nodes) if node in plugin.fixture_users[prefix]}
+            return {i for i, node in enumerate(nodes) if node in plugin.fixture_users[prefix]}
         elif phase in {"collection", "background"}:
-            consumers = set(range(len(nodes)))
-        else:
-            consumers = {i for i, node in enumerate(nodes) if node == prefix}
+            return set(range(len(nodes)))
+        return {i for i, node in enumerate(nodes) if node == prefix}
+
+    contexts = set(recorder.lines) | set(recorder.reads) | set(recorder.imports) | set(recorder.loader_reads)
+    for context in sorted(contexts):
+        phase, prefix = context
+        consumers = consumers_for(context)
         phase_stats[phase] = phase_stats.get(phase, 0) + sum(len(v) for v in recorder.lines[context].values())
         for name, lines in recorder.lines[context].items():
             for line in lines:
@@ -467,6 +553,8 @@ def artifact(root, recorder, plugin, manifest, index, metadata):
                     function_tests[name][(function, start, end)].update(consumers)
         for name in recorder.reads[context]:
             file_tests[name].update(consumers)
+        for name in recorder.loader_reads[context]:
+            loader_tests[name].update(consumers)
         for origin, module in recorder.imports[context]:
             import_tests[origin][module].update(consumers)
 
@@ -480,6 +568,48 @@ def artifact(root, recorder, plugin, manifest, index, metadata):
             set_numbers[key] = len(sets)
             sets.append(list(key))
         return set_numbers[key]
+
+    # Attribute/global identifiers are conservative aliases: matching names
+    # across different classes are unioned, never assumed disjoint.
+    attribute_tests = defaultdict(set)
+    reflection_tests, dynamic_attribute_tests = set(), set()
+    for context in recorder.source_observers:
+        reflection_tests.update(consumers_for(context))
+    reflection_names = {"getsource", "getsourcelines", "findsource", "getframeinfo", "currentframe",
+                        "_getframe", "format_exc", "format_exception", "extract_tb", "format_stack", "stack"}
+    for path in sorted(executable):
+        tree = ast.parse((root / path).read_bytes())
+        for node in ast.walk(tree):
+            name = None
+            reflective = dynamic = False
+            if isinstance(node, (ast.Attribute, ast.Name)) and isinstance(node.ctx, ast.Load):
+                name = node.attr if isinstance(node, ast.Attribute) else node.id
+                reflective = name.startswith(("co_", "tb_")) or name in {"__code__", "f_lineno", "f_code"}
+            elif isinstance(node, ast.Call):
+                called = getattr(node.func, "attr", getattr(node.func, "id", ""))
+                reflective = called in reflection_names
+                if called in {"getattr", "hasattr"}:
+                    if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
+                        name = node.args[1].value
+                    else:
+                        dynamic = True
+                if called in {"vars", "eval", "exec", "globals", "locals"}:
+                    # Namespace/attribute discovery is relevant to binding
+                    # changes. It does not itself inspect function bodies or
+                    # source positions; subsequent __code__/frame/source reads
+                    # are indexed separately. Otherwise an ordinary globals()
+                    # in module initialization makes every test a source reader.
+                    dynamic = True
+            if name or reflective or dynamic:
+                users = set()
+                for line in range(node.lineno, node.end_lineno + 1):
+                    users.update(line_tests[path].get(line, ()))
+                if name:
+                    attribute_tests[name].update(users)
+                if reflective:
+                    reflection_tests.update(users)
+                if dynamic:
+                    dynamic_attribute_tests.update(users)
 
     encoded_lines, encoded_functions = {}, {}
     for name, mapping in sorted(line_tests.items()):
@@ -506,8 +636,21 @@ def artifact(root, recorder, plugin, manifest, index, metadata):
                                for phase in ("setup", "call", "teardown"))]
     structure = analyze(root, source_modules)
     unresolved = structure.pop("unresolved") + recorder.unresolved + plugin.unresolved
+    known_classes = {(row["file"], row["line"]) for row in recorder.classes.values()}
+    unresolved = [issue for issue in unresolved if not (
+        issue.get("kind") == "inheritance" and issue.get("reason") == "base is external or unresolved statically"
+        and (issue.get("file"), issue.get("line")) in known_classes)]
     unresolved = [json.loads(row) for row in sorted({json.dumps(row, sort_keys=True) for row in unresolved})]
     missing_mappings = [node for node in nodes if not recorder.lines.get(("call", node))]
+    gap_tests = set()
+    scoped_gaps = []
+    for issue in recorder.scoped_issues:
+        affected = sorted(nodes[i] for i in consumers_for((issue["phase"], issue["consumer"])))
+        if not affected:
+            recorder.issues.add("unresolved owner of instrumentation gap: " + issue["reason"])
+        gap_tests.update(affected)
+        scoped_gaps.append({"reason": issue["reason"], "tests": affected})
+    scoped_gaps = [json.loads(row) for row in sorted({json.dumps(row, sort_keys=True) for row in scoped_gaps})]
     metadata.update({
         "collected_tests": len(nodes), "incomplete_tests": incomplete_nodes,
         "outcomes": dict(sorted(plugin.outcomes.items())),
@@ -517,10 +660,14 @@ def artifact(root, recorder, plugin, manifest, index, metadata):
         "unresolved_dependencies": unresolved,
         "missing_mappings": missing_mappings,
         "instrumentation_issues": sorted(recorder.issues),
+        "scoped_instrumentation_issues": scoped_gaps,
+        "gap_tests": sorted(gap_tests),
+        "read_provenance": "loader-separated-v1",
+        "reflection_index": "executed-identifiers-v1",
         "run_complete": metadata["pytest_exit_code"] == 0 and not plugin.collection_errors
                         and all("setup" in plugin.outcomes[node] and "teardown" in plugin.outcomes[node]
                                 for node in nodes),
-        "instrumentation_complete": not recorder.issues and not incomplete_nodes and not unresolved and not missing_mappings,
+        "instrumentation_complete": not recorder.issues and not gap_tests and not incomplete_nodes and not unresolved and not missing_mappings,
         "sound_for_unseen_changes": False,
         "source_lines_executed": seen, "source_lines_possible": total,
         "source_line_coverage_percent": round(100 * seen / total, 3) if total else None,
@@ -528,18 +675,22 @@ def artifact(root, recorder, plugin, manifest, index, metadata):
         "source_files_total": len(package_files),
         "phase_line_observations": phase_stats,
         "limitations": [
-            "Only Python execution and Python-audited file opens in this process are observed; native I/O and child processes are not traced.",
+            "Python children and pool tasks are traced; unreported children remain scoped gaps. Native I/O is not traced.",
             "Collection dependencies apply to all collected tests; fixture parameter instances share a union of their consumers.",
             "Fixture graphs use pytest private metadata; unavailable relationships are explicitly unresolved.",
             "Static imports include unexecuted branches; dynamic imports are observed only on exercised paths.",
             "Untaken branches, absent files, filesystem metadata checks and future changes are not covered by dynamic maps.",
-            "Threaded execution can invalidate per-context monitoring deduplication; detected threads mark instrumentation incomplete.",
+            "Background threads use independent thread-local tracing; their observations conservatively apply to all tests.",
         ],
     })
     result = {
         "schema": SCHEMA, "metadata": metadata, "tests": nodes, "test_sets": sets,
         "lines": encoded_lines, "functions": encoded_functions,
         "reads": {name: intern(users) for name, users in sorted(file_tests.items())},
+        "loader_reads": {name: intern(users) for name, users in sorted(loader_tests.items())},
+        "attribute_reads": {name: intern(users) for name, users in sorted(attribute_tests.items())},
+        "reflection_tests": intern(reflection_tests),
+        "dynamic_attribute_tests": intern(dynamic_attribute_tests),
         "imports": {name: [[module, intern(users)] for module, users in sorted(deps.items())]
                     for name, deps in sorted(import_tests.items())},
         "static_imports": static_imports, "modules": dict(sorted(modules.items())),
@@ -615,6 +766,14 @@ def main():
     os.chdir(root)
     sys.path.insert(0, str(root))
     recorder = Recorder(root)
+    trace_directory = tempfile.TemporaryDirectory(prefix="selector-traces-")
+    hook_directory = Path(trace_directory.name) / "hook"
+    hook_directory.mkdir()
+    (hook_directory / "sitecustomize.py").write_text("from process_dependencies import startup\nstartup()\n")
+    os.environ["SELECTOR_TRACE_ROOT"] = str(root)
+    os.environ["SELECTOR_TRACE_DIRECTORY"] = trace_directory.name
+    os.environ["PYTHONPATH"] = os.pathsep.join([str(hook_directory), str(Path(__file__).resolve().parent),
+                                               str(root), os.environ.get("PYTHONPATH", "")])
     plugin = Plugin(recorder)
     started = time.monotonic()
     exit_code = 3
@@ -631,6 +790,17 @@ def main():
     finally:
         recorder.stop()
         signal.alarm(0)
+        from process_dependencies import merge_children
+        merge_children(recorder, trace_directory.name)
+        child_diagnostics = []
+        for path in sorted(Path(trace_directory.name).glob('*.stderr.log')):
+            with path.open() as stream:
+                diagnostic = stream.read(16000)
+            if diagnostic:
+                child_diagnostics.append(diagnostic)
+            if len(child_diagnostics) >= 8:
+                break
+        trace_directory.cleanup()
         after = source_manifest(root)
         if after != manifest:
             recorder.issues.add("source tree changed during tests")
@@ -644,7 +814,7 @@ def main():
             "collector_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "instrumentation_version": INSTRUMENTATION_VERSION,
             "instrumentation_sha256": {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-                for name in ("build_dependencies.py", "dependency_structure.py", "artifact_bundle.py", "fetch_source.py")},
+                for name in ("build_dependencies.py", "dependency_structure.py", "artifact_bundle.py", "fetch_source.py", "process_dependencies.py")},
             "environment": environment, "environment_mismatch": mismatch,
             "generation_command": command,
         }
@@ -655,6 +825,10 @@ def main():
         metadata["manifest_bytes"] = (output / "manifest.json").stat().st_size
         metadata["uncompressed_bytes"] = bundle["artifact"]["uncompressed_bytes"]
         metadata["elapsed_seconds"] = round(time.monotonic() - generation_started, 3)
+        # Host paths, PIDs and exception text are diagnostic only, never inputs
+        # to selection or part of the deterministic checked-in bundle.
+        metadata["child_diagnostics"] = child_diagnostics
+        metadata["failure_diagnostics"] = plugin.failure_diagnostics
         report_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
         report_path.chmod(0o644)
         print(json.dumps({key: metadata[key] for key in (

@@ -138,6 +138,19 @@ class ReconstructionTests(unittest.TestCase):
 
 
 class StructuralTests(unittest.TestCase):
+    def test_unchanged_duplicate_elsewhere_does_not_ambiguate_changed_function(self):
+        old = "def duplicate():\n    return 1\ndef duplicate():\n    return 2\ndef changed():\n    return 3\n"
+        result = analyze(old, old.replace("return 3", "return 4"))
+        self.assertFalse(any(reason["code"] == "ambiguous_symbol_identity" for reason in result["files"][0]["uncertainty_reasons"]))
+        changed_duplicate = analyze(old, old.replace("return 1", "return 4"))
+        self.assertTrue(any(reason["code"] == "ambiguous_symbol_identity" for reason in changed_duplicate["files"][0]["uncertainty_reasons"]))
+
+    def test_docstring_changes_are_definition_time_changes(self):
+        old = 'def value():\n    "old documentation"\n    return 1\n'
+        result = analyze(old, old.replace("old documentation", "new documentation"))
+        self.assertTrue(symbol(result, "value")["definition_time_change"])
+        self.assertTrue(result["files"][0]["python"]["requires_import_expansion"])
+
     def test_insertion_boundaries_and_line_shifts(self):
         old = "def first():\n    return 1\n\ndef last():\n    return 2\n"
         new = old.replace("def last():", "def added():\n    return 3\n\ndef last():")
